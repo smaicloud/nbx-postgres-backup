@@ -16,3 +16,4 @@ Comfortable shell script to backup your netbox postgres db (works for all other 
     psql -c 'drop database netbox'
     psql -c 'create database netbox'
     psql netbox < netbox.sql
+	
