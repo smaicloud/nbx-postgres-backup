@@ -1,206 +1,257 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# pg_backup_rotated.sh
+#
+# Wrapper around pg_dump logic with simple rotation.
+# - Loads configuration from pg_backup.config (or via -c <file>)
+# - Creates either a *daily* or *weekly* backup directory
+# - Deletes old backup directories based on DAYS_TO_KEEP and WEEKS_TO_KEEP
+#
+# Usage:
+#   ./pg_backup_rotated.sh              # uses default config search
+#   ./pg_backup_rotated.sh -c /path/to/pg_backup.config
+#
 
-###########################
-####### LOAD CONFIG #######
-###########################
+set -euo pipefail
+IFS=$'\n\t'
 
-while [ $# -gt 0 ]; do
-        case $1 in
-                -c)
-                        CONFIG_FILE_PATH="$2"
-                        shift 2
-                        ;;
-                *)
-                        ${ECHO} "Unknown Option \"$1\"" 1>&2
-                        exit 2
-                        ;;
-        esac
-done
+#######################################
+# Helper functions
+#######################################
 
-if [ -z $CONFIG_FILE_PATH ] ; then
-        SCRIPTPATH=$(cd ${0%/*} && pwd -P)
-        CONFIG_FILE_PATH="${SCRIPTPATH}/pg_backup.config"
-fi
-
-if [ ! -r ${CONFIG_FILE_PATH} ] ; then
-        echo "Could not load config file from ${CONFIG_FILE_PATH}" 1>&2
-        exit 1
-fi
-
-source "${CONFIG_FILE_PATH}"
-
-###########################
-#### PRE-BACKUP CHECKS ####
-###########################
-
-# Make sure we're running as the required backup user
-if [ "$BACKUP_USER" != "" -a "$(id -un)" != "$BACKUP_USER" ] ; then
-	echo "This script must be run as $BACKUP_USER. Exiting." 1>&2
-	exit 1
-fi
-
-
-###########################
-### INITIALISE DEFAULTS ###
-###########################
-
-if [ ! $HOSTNAME ]; then
-	HOSTNAME="localhost"
-fi;
-
-if [ ! $USERNAME ]; then
-	USERNAME="postgres"
-fi;
-
-
-###########################
-#### START THE BACKUPS ####
-###########################
-
-function perform_backups()
-{
-	SUFFIX=$1
-	FINAL_BACKUP_DIR=$BACKUP_DIR"`date +\%Y-\%m-\%d`$SUFFIX/"
-
-	echo "Making backup directory in $FINAL_BACKUP_DIR"
-
-	if ! mkdir -p $FINAL_BACKUP_DIR; then
-		echo "Cannot create backup directory in $FINAL_BACKUP_DIR. Go and fix it!" 1>&2
-		exit 1;
-	fi;
-	
-	#######################
-	### GLOBALS BACKUPS ###
-	#######################
-
-	echo -e "\n\nPerforming globals backup"
-	echo -e "--------------------------------------------\n"
-
-	if [ $ENABLE_GLOBALS_BACKUPS = "yes" ]
-	then
-		    echo "Globals backup"
-
-		    set -o pipefail
-		    if ! pg_dumpall -g -h "$HOSTNAME" -U "$USERNAME" | gzip > $FINAL_BACKUP_DIR"globals".sql.gz.in_progress; then
-		            echo "[!!ERROR!!] Failed to produce globals backup" 1>&2
-		    else
-		            mv $FINAL_BACKUP_DIR"globals".sql.gz.in_progress $FINAL_BACKUP_DIR"globals".sql.gz
-		    fi
-		    set +o pipefail
-	else
-		echo "None"
-	fi
-
-
-	###########################
-	### SCHEMA-ONLY BACKUPS ###
-	###########################
-	
-	for SCHEMA_ONLY_DB in ${SCHEMA_ONLY_LIST//,/ }
-	do
-	        SCHEMA_ONLY_CLAUSE="$SCHEMA_ONLY_CLAUSE or datname ~ '$SCHEMA_ONLY_DB'"
-	done
-	
-	SCHEMA_ONLY_QUERY="select datname from pg_database where false $SCHEMA_ONLY_CLAUSE order by datname;"
-	
-	echo -e "\n\nPerforming schema-only backups"
-	echo -e "--------------------------------------------\n"
-	
-	SCHEMA_ONLY_DB_LIST=`psql -h "$HOSTNAME" -U "$USERNAME" -At -c "$SCHEMA_ONLY_QUERY" postgres`
-	
-	echo -e "The following databases were matched for schema-only backup:\n${SCHEMA_ONLY_DB_LIST}\n"
-	
-	for DATABASE in $SCHEMA_ONLY_DB_LIST
-	do
-	        echo "Schema-only backup of $DATABASE"
-		set -o pipefail
-	        if ! pg_dump -Fp -s -h "$HOSTNAME" -U "$USERNAME" "$DATABASE" | gzip > $FINAL_BACKUP_DIR"$DATABASE"_SCHEMA.sql.gz.in_progress; then
-	                echo "[!!ERROR!!] Failed to backup database schema of $DATABASE" 1>&2
-	        else
-	                mv $FINAL_BACKUP_DIR"$DATABASE"_SCHEMA.sql.gz.in_progress $FINAL_BACKUP_DIR"$DATABASE"_SCHEMA.sql.gz
-	        fi
-	        set +o pipefail
-	done
-	
-	
-	###########################
-	###### FULL BACKUPS #######
-	###########################
-
-	for SCHEMA_ONLY_DB in ${SCHEMA_ONLY_LIST//,/ }
-	do
-		EXCLUDE_SCHEMA_ONLY_CLAUSE="$EXCLUDE_SCHEMA_ONLY_CLAUSE and datname !~ '$SCHEMA_ONLY_DB'"
-	done
-
-	FULL_BACKUP_QUERY="select datname from pg_database where not datistemplate and datallowconn $EXCLUDE_SCHEMA_ONLY_CLAUSE order by datname;"
-
-	echo -e "\n\nPerforming full backups"
-	echo -e "--------------------------------------------\n"
-
-	for DATABASE in `psql -h "$HOSTNAME" -U "$USERNAME" -At -c "$FULL_BACKUP_QUERY" postgres`
-	do
-		if [ $ENABLE_PLAIN_BACKUPS = "yes" ]
-		then
-			echo "Plain backup of $DATABASE"
-	 
-			set -o pipefail
-			if ! pg_dump -Fp -h "$HOSTNAME" -U "$USERNAME" "$DATABASE" | gzip > $FINAL_BACKUP_DIR"$DATABASE".sql.gz.in_progress; then
-				echo "[!!ERROR!!] Failed to produce plain backup database $DATABASE" 1>&2
-			else
-				mv $FINAL_BACKUP_DIR"$DATABASE".sql.gz.in_progress $FINAL_BACKUP_DIR"$DATABASE".sql.gz
-			fi
-			set +o pipefail
-                        
-		fi
-
-		if [ $ENABLE_CUSTOM_BACKUPS = "yes" ]
-		then
-			echo "Custom backup of $DATABASE"
-	
-			if ! pg_dump -Fc -h "$HOSTNAME" -U "$USERNAME" "$DATABASE" -f $FINAL_BACKUP_DIR"$DATABASE".custom.in_progress; then
-				echo "[!!ERROR!!] Failed to produce custom backup database $DATABASE"
-			else
-				mv $FINAL_BACKUP_DIR"$DATABASE".custom.in_progress $FINAL_BACKUP_DIR"$DATABASE".custom
-			fi
-		fi
-
-	done
-
-	echo -e "\nAll database backups complete!"
+log() {
+  printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-# MONTHLY BACKUPS
+die() {
+  printf '[%s] [ERROR] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >&2
+  exit 1
+}
 
-DAY_OF_MONTH=`date +%d`
+#######################################
+# Load configuration
+#######################################
 
-if [ $DAY_OF_MONTH -eq 1 ];
-then
-	# Delete all expired monthly directories
-	find $BACKUP_DIR -maxdepth 1 -name "*-monthly" -exec rm -rf '{}' ';'
-	        	
-	perform_backups "-monthly"
-	
-	exit 0;
+CONFIG_FILE_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c)
+      CONFIG_FILE_PATH="$2"
+      shift 2
+      ;;
+    -*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      die "Unexpected argument: $1"
+      ;;
+  esac
+done
+
+# Search for config file if not provided explicitly
+if [[ -z "${CONFIG_FILE_PATH}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for candidate in \
+    "./pg_backup.config" \
+    "${SCRIPT_DIR}/pg_backup.config" \
+    "/etc/pg_backup.config"
+  do
+    if [[ -r "${candidate}" ]]; then
+      CONFIG_FILE_PATH="${candidate}"
+      break
+    fi
+  done
 fi
 
-# WEEKLY BACKUPS
+[[ -n "${CONFIG_FILE_PATH}" ]] || die "No readable pg_backup.config found"
+[[ -r "${CONFIG_FILE_PATH}" ]] || die "Config file '${CONFIG_FILE_PATH}' not readable"
 
-DAY_OF_WEEK=`date +%u` #1-7 (Monday-Sunday)
-EXPIRED_DAYS=`expr $((($WEEKS_TO_KEEP * 7) + 1))`
+log "Using config file: ${CONFIG_FILE_PATH}"
+# shellcheck disable=SC1090
+source "${CONFIG_FILE_PATH}"
 
-if [ $DAY_OF_WEEK = $DAY_OF_WEEK_TO_KEEP ];
-then
-	# Delete all expired weekly directories
-	find $BACKUP_DIR -maxdepth 1 -mtime +$EXPIRED_DAYS -name "*-weekly" -exec rm -rf '{}' ';'
-	        	
-	perform_backups "-weekly"
-	
-	exit 0;
+#######################################
+# Validate environment & defaults
+#######################################
+
+BACKUP_USER="${BACKUP_USER:-}"
+HOSTNAME="${HOSTNAME:-localhost}"
+USERNAME="${USERNAME:-postgres}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/postgresql}"
+SCHEMA_ONLY_LIST="${SCHEMA_ONLY_LIST:-}"
+ENABLE_PLAIN_BACKUPS="${ENABLE_PLAIN_BACKUPS:-yes}"
+ENABLE_CUSTOM_BACKUPS="${ENABLE_CUSTOM_BACKUPS:-no}"
+ENABLE_GLOBALS_BACKUPS="${ENABLE_GLOBALS_BACKUPS:-no}"
+DAY_OF_WEEK_TO_KEEP="${DAY_OF_WEEK_TO_KEEP:-7}"
+DAYS_TO_KEEP="${DAYS_TO_KEEP:-14}"
+WEEKS_TO_KEEP="${WEEKS_TO_KEEP:-8}"
+
+# Enforce backup user if configured
+if [[ -n "${BACKUP_USER}" ]]; then
+  CURRENT_USER="$(id -un)"
+  if [[ "${CURRENT_USER}" != "${BACKUP_USER}" ]]; then
+    die "Script must be run as '${BACKUP_USER}', current user is '${CURRENT_USER}'"
+  fi
 fi
 
-# DAILY BACKUPS
+if [[ ! -d "${BACKUP_DIR}" ]]; then
+  log "Creating backup directory: ${BACKUP_DIR}"
+  mkdir -p "${BACKUP_DIR}"
+fi
 
-# Delete daily backups 7 days old or more
-find $BACKUP_DIR -maxdepth 1 -mtime +$DAYS_TO_KEEP -name "*-daily" -exec rm -rf '{}' ';'
+#######################################
+# Core backup function
+#######################################
+
+perform_backups() {
+  local SUFFIX="$1"
+
+  local DATE_STAMP
+  DATE_STAMP="$(date +%Y-%m-%d)"
+  local FINAL_BACKUP_DIR="${BACKUP_DIR}/${DATE_STAMP}${SUFFIX}"
+
+  mkdir -p "${FINAL_BACKUP_DIR}"
+  log "Writing backups into: ${FINAL_BACKUP_DIR}"
+
+  # Globals
+  if [[ "${ENABLE_GLOBALS_BACKUPS}" == "yes" ]]; then
+    log "Backing up global objects (roles, privileges, tablespaces)"
+    if ! pg_dumpall -g -h "${HOSTNAME}" -U "${USERNAME}" \
+      | gzip > "${FINAL_BACKUP_DIR}/globals.sql.gz".in_progress; then
+      die "Failed to dump global objects"
+    fi
+    mv "${FINAL_BACKUP_DIR}/globals.sql.gz".in_progress \
+       "${FINAL_BACKUP_DIR}/globals.sql.gz"
+  else
+    log "Skipping globals backup (ENABLE_GLOBALS_BACKUPS != yes)"
+  fi
+
+  # Schema-only backups
+  local SCHEMA_ONLY_CLAUSE=""
+  if [[ -n "${SCHEMA_ONLY_LIST}" ]]; then
+    for SCHEMA_ONLY_DB in ${SCHEMA_ONLY_LIST//,/ }; do
+      SCHEMA_ONLY_CLAUSE="${SCHEMA_ONLY_CLAUSE} OR datname = '${SCHEMA_ONLY_DB}'"
+    done
+  fi
+
+  local SCHEMA_ONLY_DB_LIST=""
+  if [[ -n "${SCHEMA_ONLY_CLAUSE}" ]]; then
+    local SCHEMA_ONLY_QUERY="SELECT datname
+                             FROM pg_database
+                             WHERE datallowconn
+                               AND NOT datistemplate
+                               AND (false ${SCHEMA_ONLY_CLAUSE})
+                             ORDER BY datname;"
+    SCHEMA_ONLY_DB_LIST="$(psql -h "${HOSTNAME}" -U "${USERNAME}" -At -c "${SCHEMA_ONLY_QUERY}" postgres || true)"
+  fi
+
+  if [[ -n "${SCHEMA_ONLY_DB_LIST}" ]]; then
+    log "Schema-only backups for databases:"
+    printf '%s\n' "${SCHEMA_ONLY_DB_LIST}"
+  else
+    log "No databases matched for schema-only backup"
+  fi
+
+  local DATABASE
+  for DATABASE in ${SCHEMA_ONLY_DB_LIST}; do
+    log "Schema-only backup for database: ${DATABASE}"
+
+    if [[ "${ENABLE_PLAIN_BACKUPS}" == "yes" ]]; then
+      if ! pg_dump -Fp -s -h "${HOSTNAME}" -U "${USERNAME}" "${DATABASE}" \
+        | gzip > "${FINAL_BACKUP_DIR}/${DATABASE}_schema.sql.gz".in_progress; then
+        die "Failed to produce schema-only plain backup of ${DATABASE}"
+      fi
+      mv "${FINAL_BACKUP_DIR}/${DATABASE}_schema.sql.gz".in_progress \
+         "${FINAL_BACKUP_DIR}/${DATABASE}_schema.sql.gz"
+    fi
+
+    if [[ "${ENABLE_CUSTOM_BACKUPS}" == "yes" ]]; then
+      if ! pg_dump -Fc -s -h "${HOSTNAME}" -U "${USERNAME}" "${DATABASE}" \
+        -f "${FINAL_BACKUP_DIR}/${DATABASE}_schema.custom".in_progress; then
+        die "Failed to produce schema-only custom backup of ${DATABASE}"
+      fi
+      mv "${FINAL_BACKUP_DIR}/${DATABASE}_schema.custom".in_progress \
+         "${FINAL_BACKUP_DIR}/${DATABASE}_schema.custom"
+    fi
+  done
+
+  # Full backups (excluding schema-only)
+  local EXCLUDE_SCHEMA_ONLY_CLAUSE=""
+  if [[ -n "${SCHEMA_ONLY_LIST}" ]]; then
+    for SCHEMA_ONLY_DB in ${SCHEMA_ONLY_LIST//,/ }; do
+      EXCLUDE_SCHEMA_ONLY_CLAUSE="${EXCLUDE_SCHEMA_ONLY_CLAUSE} AND datname <> '${SCHEMA_ONLY_DB}'"
+    done
+  fi
+
+  local FULL_BACKUP_QUERY="SELECT datname
+                           FROM pg_database
+                           WHERE datallowconn
+                             AND NOT datistemplate
+                             ${EXCLUDE_SCHEMA_ONLY_CLAUSE}
+                           ORDER BY datname;"
+
+  local FULL_DB_LIST
+  FULL_DB_LIST="$(psql -h "${HOSTNAME}" -U "${USERNAME}" -At -c "${FULL_BACKUP_QUERY}" postgres || true)"
+
+  if [[ -n "${FULL_DB_LIST}" ]]; then
+    log "Full backups for databases:"
+    printf '%s\n' "${FULL_DB_LIST}"
+  else
+    log "No databases matched for full backup"
+  fi
+
+  for DATABASE in ${FULL_DB_LIST}; do
+    log "Full backup for database: ${DATABASE}"
+
+    if [[ "${ENABLE_PLAIN_BACKUPS}" == "yes" ]]; then
+      if ! pg_dump -Fp -h "${HOSTNAME}" -U "${USERNAME}" "${DATABASE}" \
+        | gzip > "${FINAL_BACKUP_DIR}/${DATABASE}.sql.gz".in_progress; then
+        die "Failed to produce plain backup of ${DATABASE}"
+      fi
+      mv "${FINAL_BACKUP_DIR}/${DATABASE}.sql.gz".in_progress \
+         "${FINAL_BACKUP_DIR}/${DATABASE}.sql.gz"
+    fi
+
+    if [[ "${ENABLE_CUSTOM_BACKUPS}" == "yes" ]]; then
+      if ! pg_dump -Fc -h "${HOSTNAME}" -U "${USERNAME}" "${DATABASE}" \
+        -f "${FINAL_BACKUP_DIR}/${DATABASE}.custom".in_progress; then
+        die "Failed to produce custom backup of ${DATABASE}"
+      fi
+      mv "${FINAL_BACKUP_DIR}/${DATABASE}.custom".in_progress \
+         "${FINAL_BACKUP_DIR}/${DATABASE}.custom"
+    fi
+  done
+
+  log "Backup run for suffix '${SUFFIX}' completed."
+}
+
+#######################################
+# Rotation logic
+#######################################
+
+DAY_OF_WEEK="$(date +%u)"
+
+# Weekly backup (if today matches configured weekday)
+if [[ "${DAY_OF_WEEK}" == "${DAY_OF_WEEK_TO_KEEP}" ]]; then
+  log "Weekly backup day (weekday ${DAY_OF_WEEK})."
+
+  # Calculate expiry for weekly backups in days
+  EXPIRED_DAYS=$(( WEEKS_TO_KEEP * 7 ))
+
+  log "Pruning weekly backups older than ${EXPIRED_DAYS} days."
+  find "${BACKUP_DIR}" -maxdepth 1 -type d -name "*-weekly" -mtime +"${EXPIRED_DAYS}" -print -exec rm -rf {} \;
+
+  perform_backups "-weekly"
+  exit 0
+fi
+
+# Daily backup (default path)
+log "Running daily backup."
+
+log "Pruning daily backups older than ${DAYS_TO_KEEP} days."
+find "${BACKUP_DIR}" -maxdepth 1 -type d -name "*-daily" -mtime +"${DAYS_TO_KEEP}" -print -exec rm -rf {} \;
 
 perform_backups "-daily"
+
+log "Rotated backup script completed successfully."
